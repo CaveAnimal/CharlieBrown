@@ -2,59 +2,116 @@ package com.example.codetools;
 
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.util.*;
-import lombok.extern.slf4j.Slf4j;
 
-@Slf4j
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.util.concurrent.TimeUnit;
+import java.util.ArrayList;
+import java.util.List;
+
 @Service
 public class OllamaClient {
+
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(OllamaClient.class);
 
     private final String command;
     private final String model;
 
     public OllamaClient(Environment env) {
-        this.command = env.getProperty("ollama.command");
-        this.model = env.getProperty("ollama.model");
+        this.command = env.getProperty("ollama.command", "ollama");
+        this.model = env.getProperty("ollama.model", "codellama:13b-instruct");
     }
 
     public String queryModel(String question, List<QueryModels.CodeSnippet> snippets) throws Exception {
-        log.info("OllamaClient: Received question: {}", question);
-        log.info("OllamaClient: Number of code snippets: {}", snippets != null ? snippets.size() : 0);
         List<String> cmd = new ArrayList<>();
         cmd.add(command);
         cmd.add("run");
         cmd.add(model);
-        StringBuilder prompt = new StringBuilder(question.replaceAll("\n", " ") + " ");
-        if (snippets != null) {
-            snippets.forEach(s -> prompt.append("File: ").append(s.getPath()).append(" ")
-                    .append(s.getContent().replaceAll("\n", " ")).append(" "));
-        }
-        log.info("OllamaClient: Original prompt (pre-formatting): {}", prompt);
-        String promptStr = prompt.toString().replaceAll(",", " ").trim();
-        cmd.add(promptStr);
-        log.info("OllamaClient: Running command: {}", String.join(" ", cmd));
-        log.info("OllamaClient: Everything sent to Ollama:\n{}", promptStr);
 
+        // Build a clearer prompt: instruction + fenced code blocks per file
+        StringBuilder prompt = new StringBuilder();
+        prompt.append("You are a helpful programming assistant. Answer the question and explain any edge cases.\n\n");
+        prompt.append("Question: ").append(question).append("\n\n");
+        if (snippets != null && !snippets.isEmpty()) {
+            for (QueryModels.CodeSnippet s : snippets) {
+                prompt.append("File: ").append(s.getPath()).append("\n");
+                // choose language tag based on file extension
+                String lang = "text";
+                if (s.getPath().toLowerCase().endsWith(".java")) lang = "java";
+                else if (s.getPath().toLowerCase().endsWith(".js")) lang = "javascript";
+                prompt.append("```" + lang + "\n");
+                prompt.append(s.getContent()).append("\n");
+                prompt.append("```\n\n");
+            }
+        }
+
+        String promptStr = prompt.toString().trim();
+        log.info("OllamaClient: Running command: {} [prompt length={}]", String.join(" ", cmd), promptStr.length());
+        log.debug("OllamaClient: Everything that will be sent to Ollama (truncated 1000 chars):\n{}", promptStr.length() > 1000 ? promptStr.substring(0, 1000) + "..." : promptStr);
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
         try {
-            ProcessBuilder pb = new ProcessBuilder(cmd);
             Process proc = pb.start();
-            BufferedReader out = new BufferedReader(new InputStreamReader(proc.getInputStream()));
+
+            // write prompt to stdin of the process to avoid CLI quoting/length issues
+            try (java.io.OutputStream os = proc.getOutputStream()) {
+                os.write(promptStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                os.flush();
+            } catch (IOException io) {
+                log.error("OllamaClient: Error writing prompt to Ollama stdin", io);
+            }
+
             StringBuilder resp = new StringBuilder();
-            String line;
-            boolean gotResponse = false;
-            while ((line = out.readLine()) != null) {
-                gotResponse = true;
-                resp.append(line).append("\n");
+            StringBuilder err = new StringBuilder();
+
+            Thread outReader = new Thread(() -> {
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                    String l;
+                    while ((l = r.readLine()) != null) {
+                        resp.append(l).append("\n");
+                    }
+                } catch (IOException io) {
+                    log.error("OllamaClient: Error reading stdout", io);
+                }
+            }, "ollama-stdout-reader");
+
+            Thread errReader = new Thread(() -> {
+                try (BufferedReader r = new BufferedReader(new InputStreamReader(proc.getErrorStream()))) {
+                    String l;
+                    while ((l = r.readLine()) != null) {
+                        err.append(l).append("\n");
+                    }
+                } catch (IOException io) {
+                    log.error("OllamaClient: Error reading stderr", io);
+                }
+            }, "ollama-stderr-reader");
+
+            outReader.start();
+            errReader.start();
+
+            boolean finished = proc.waitFor(180, TimeUnit.SECONDS);
+            // Give readers a moment to drain
+            outReader.join(2000);
+            errReader.join(2000);
+
+            int exitCode = finished ? proc.exitValue() : -1;
+            if (!finished) {
+                log.warn("OllamaClient: Process did not finish within timeout, destroying...");
+                proc.destroyForcibly();
             }
-            int exitCode = proc.waitFor();
-            log.info("OllamaClient: Process exited with code {}", exitCode);
-            if (!gotResponse) {
-                log.warn("OllamaClient: No response received from Ollama. Check if Ollama is running and the model is available. Command: {}", String.join(" ", cmd));
+            log.info("OllamaClient: Process exited with code {} (finished={} )", exitCode, finished);
+
+            if (err.length() > 0) {
+                log.warn("OllamaClient: Stderr from Ollama:\n{}", err.toString().trim());
+            }
+
+            if (resp.length() == 0) {
+                log.warn("OllamaClient: No stdout response received from Ollama. Check if Ollama is running and the model is available. Command: {}", String.join(" ", cmd));
             } else {
-                log.info("OllamaClient: Raw response from Ollama:\n{}", resp);
+                log.info("OllamaClient: Raw response from Ollama:\n{}", resp.toString().trim());
             }
+
             return resp.toString().trim();
         } catch (Exception e) {
             log.error("OllamaClient: Exception while running Ollama command: {}", String.join(" ", cmd), e);
