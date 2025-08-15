@@ -1,6 +1,6 @@
 package com.example.codetools;
 
-import org.springframework.context.annotation.Profile;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -8,7 +8,7 @@ import java.util.Collections;
 import java.util.concurrent.atomic.AtomicLong;
 
 @Service
-@Profile("!ann-dev")
+@ConditionalOnMissingBean(AnnIndex.class)
 public class NoopAnnService implements AnnIndex {
 
     private final AtomicLong counter = new AtomicLong(0);

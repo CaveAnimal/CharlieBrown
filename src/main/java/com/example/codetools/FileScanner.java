@@ -21,8 +21,9 @@ public class FileScanner {
     private final VectorService vectorService;
 
     public FileScanner(org.springframework.core.env.Environment env, VectorService vectorService) {
-    this.rootPath = env.getProperty("scanner.root.path", "");
-        this.applicationId = env.getProperty("application.id", "default-app");
+        String rp = env.getProperty("scanner.root.path");
+        this.rootPath = rp == null ? "" : rp;
+    this.applicationId = env.getProperty("application.id", "default-app");
         this.vectorService = vectorService;
     }
 

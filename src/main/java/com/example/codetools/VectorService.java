@@ -30,8 +30,13 @@ public class VectorService {
 
     @Autowired
     private ObjectMapper mapper;
-    @Autowired
-    private AnnIndex annService;
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<AnnIndex> annServiceProvider;
+
+    private AnnIndex annService() {
+        AnnIndex s = annServiceProvider == null ? null : annServiceProvider.getIfAvailable();
+        return s == null ? new NoopAnnService() : s;
+    }
     @Transactional
     public void upsert(String applicationId, String path, String content) {
         upsert(applicationId, path, content, 0, 0, 0);
@@ -66,7 +71,7 @@ public class VectorService {
             repo.save(r);
             // push into ANN index (best-effort)
             try {
-                annService.add(r.getId(), vec);
+                annService().add(r.getId(), vec);
             } catch (Exception ex) {
                 log.warn("failed to add to ANN: {}", ex.getMessage());
             }
