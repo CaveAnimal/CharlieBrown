@@ -18,9 +18,15 @@ public class OllamaClient {
     private final String command;
     private final String model;
 
-    public OllamaClient(Environment env) {
+    private final OllamaPromptBuilder promptBuilder;
+
+    private final ProcessRunner processRunner;
+
+    public OllamaClient(Environment env, OllamaPromptBuilder promptBuilder, ProcessRunner processRunner) {
         this.command = env.getProperty("ollama.command", "ollama");
         this.model = env.getProperty("ollama.model", "codellama:13b-instruct");
+        this.promptBuilder = promptBuilder;
+        this.processRunner = processRunner;
     }
 
     public String queryModel(String question, List<QueryModels.CodeSnippet> snippets) throws Exception {
@@ -29,30 +35,12 @@ public class OllamaClient {
         cmd.add("run");
         cmd.add(model);
 
-        // Build a clearer prompt: instruction + fenced code blocks per file
-        StringBuilder prompt = new StringBuilder();
-        prompt.append("You are a helpful programming assistant. Answer the question and explain any edge cases.\n\n");
-        prompt.append("Question: ").append(question).append("\n\n");
-        if (snippets != null && !snippets.isEmpty()) {
-            for (QueryModels.CodeSnippet s : snippets) {
-                prompt.append("File: ").append(s.getPath()).append("\n");
-                // choose language tag based on file extension
-                String lang = "text";
-                if (s.getPath().toLowerCase().endsWith(".java")) lang = "java";
-                else if (s.getPath().toLowerCase().endsWith(".js")) lang = "javascript";
-                prompt.append("```" + lang + "\n");
-                prompt.append(s.getContent()).append("\n");
-                prompt.append("```\n\n");
-            }
-        }
-
-        String promptStr = prompt.toString().trim();
+    String promptStr = promptBuilder.build(question, snippets);
         log.info("OllamaClient: Running command: {} [prompt length={}]", String.join(" ", cmd), promptStr.length());
         log.debug("OllamaClient: Everything that will be sent to Ollama (truncated 1000 chars):\n{}", promptStr.length() > 1000 ? promptStr.substring(0, 1000) + "..." : promptStr);
 
-        ProcessBuilder pb = new ProcessBuilder(cmd);
         try {
-            Process proc = pb.start();
+            Process proc = processRunner.start(cmd);
 
             // write prompt to stdin of the process to avoid CLI quoting/length issues
             try (java.io.OutputStream os = proc.getOutputStream()) {

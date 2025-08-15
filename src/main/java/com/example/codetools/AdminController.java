@@ -8,7 +8,7 @@ import org.springframework.web.bind.annotation.*;
 public class AdminController {
 
     @Autowired
-    private AnnService annService;
+    private AnnIndex annService;
 
     @org.springframework.beans.factory.annotation.Autowired
     private VectorService vectorService;

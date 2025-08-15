@@ -21,13 +21,17 @@ public class FileScanner {
     private final VectorService vectorService;
 
     public FileScanner(org.springframework.core.env.Environment env, VectorService vectorService) {
-        this.rootPath = env.getProperty("scanner.root.path");
+    this.rootPath = env.getProperty("scanner.root.path", "");
         this.applicationId = env.getProperty("application.id", "default-app");
         this.vectorService = vectorService;
     }
 
     @PostConstruct
     public void scanRoot() throws IOException {
+        if (rootPath == null || rootPath.isBlank()) {
+            log.info("scanner.root.path not set; skipping file scan");
+            return;
+        }
         Path root = Paths.get(rootPath);
         try (Stream<Path> paths = Files.walk(root)) {
             paths.filter(Files::isRegularFile)

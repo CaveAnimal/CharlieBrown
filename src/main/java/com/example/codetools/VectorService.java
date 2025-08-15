@@ -2,6 +2,8 @@ package com.example.codetools;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.transaction.annotation.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -18,6 +20,8 @@ import java.util.*;
 @Service
 public class VectorService {
 
+    private static final Logger log = LoggerFactory.getLogger(VectorService.class);
+
     @Autowired
     private VectorRepository repo;
 
@@ -27,7 +31,7 @@ public class VectorService {
     @Autowired
     private ObjectMapper mapper;
     @Autowired
-    private AnnService annService;
+    private AnnIndex annService;
     @Transactional
     public void upsert(String applicationId, String path, String content) {
         upsert(applicationId, path, content, 0, 0, 0);
@@ -64,11 +68,11 @@ public class VectorService {
             try {
                 annService.add(r.getId(), vec);
             } catch (Exception ex) {
-                System.err.println("failed to add to ANN: " + ex.getMessage());
+                log.warn("failed to add to ANN: {}", ex.getMessage());
             }
         } catch (Exception e) {
             // don't let indexing fail the whole scan
-            System.err.println("VectorService.upsert error: " + e.getMessage());
+            log.debug("VectorService.upsert error: {}", e.getMessage(), e);
         }
     }
 
@@ -84,7 +88,7 @@ public class VectorService {
                     if (blob != null && blob.length > 0) v = gzipBytesToFloatArray(blob);
                     else v = mapper.readValue(r.getVectorJson(), float[].class);
                 } catch (Exception ex2) {
-                    System.err.println("failed to decode vector for " + r.getId() + ": " + ex2.getMessage());
+                    log.warn("failed to decode vector for {}: {}", r.getId(), ex2.getMessage());
                     continue;
                 }
                 double score = cosine(qv, v);
@@ -104,7 +108,7 @@ public class VectorService {
             }
             return out;
         } catch (Exception ex) {
-            System.err.println("VectorService.queryTopK error: " + ex.getMessage());
+            log.error("VectorService.queryTopK error: {}", ex.getMessage());
             return Collections.emptyList();
         }
     }
