@@ -46,6 +46,18 @@ public class HnswAnnService implements AnnIndex, Serializable {
     @Autowired(required = false)
     private VectorRepository vectorRepository; // used for full rebuild
 
+    // explicit no-arg constructor (preserve Spring instantiation)
+    public HnswAnnService() {
+    }
+
+    // package-private constructor for tests to configure small HNSW params without reflection
+    HnswAnnService(int m, int efConstruction, int maxItems, int rebuildPageSize) {
+        this.m = m;
+        this.efConstruction = efConstruction;
+        this.maxItems = maxItems;
+        this.rebuildPageSize = rebuildPageSize;
+    }
+
     private void ensureIndex(int dim) {
         if (index != null && dimension == dim) return;
         lock.writeLock().lock();
