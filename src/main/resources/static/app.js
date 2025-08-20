@@ -8,3 +8,5 @@ document.getElementById('ask').onclick = async () => {
   const data = await resp.json();
   document.getElementById('answer').textContent = data.answer;
 };
+
+// existing ask behavior preserved; workflow buttons are handled inline in index.html

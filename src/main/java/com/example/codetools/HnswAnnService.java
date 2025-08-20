@@ -4,12 +4,15 @@ import com.github.jelmerk.hnswlib.core.hnsw.HnswIndex;
 import com.github.jelmerk.hnswlib.core.DistanceFunctions;
 import com.github.jelmerk.hnswlib.core.SearchResult;
 import com.github.jelmerk.hnswlib.core.Item;
+import org.springframework.context.annotation.Profile;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Service;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.file.Path;
@@ -19,8 +22,10 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 @Service
-@Profile("ann-hnsw")
+@Profile("!ann-dev")
 public class HnswAnnService implements AnnIndex, Serializable {
+    // Explicit SLF4J logger used to avoid Lombok annotation processor issues in some environments
+    private static final Logger log = LoggerFactory.getLogger(HnswAnnService.class);
 
     // Fallback store used only when HNSW index is not yet initialized or for persistence compatibility
     private final Map<String, float[]> store = new HashMap<>();
@@ -42,6 +47,45 @@ public class HnswAnnService implements AnnIndex, Serializable {
 
     @Value("${hnsw.rebuild.page.size:1000}")
     private int rebuildPageSize;
+
+    @Value("${hnsw.persist.path:./data/ann-index.idx}")
+    private String persistPath;
+
+    @Value("${hnsw.auto.persist.enabled:true}")
+    private boolean autoPersistEnabled;
+
+    @Value("${hnsw.auto.persist.min-size:1}")
+    private int autoPersistMinSize;
+
+    @Value("${hnsw.auto.load.enabled:false}")
+    private boolean autoLoadEnabled;
+
+    // attempt to auto-load persisted index at startup
+    @jakarta.annotation.PostConstruct
+    public void tryAutoLoad() {
+    if (!autoLoadEnabled) return;
+    if (persistPath == null || persistPath.isBlank()) return;
+        java.nio.file.Path p = java.nio.file.Path.of(persistPath);
+        try {
+            java.nio.file.Files.createDirectories(p.getParent());
+        } catch (Exception ignored) {
+            // ignore
+        }
+        try {
+            if (java.nio.file.Files.exists(p)) {
+                loadFrom(p);
+                lastPersistedPath = p.toAbsolutePath().toString();
+                lastPersistedAt = java.time.Instant.now();
+                log.info("Loaded HNSW index from {}", lastPersistedPath);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to load persisted HNSW index from {}: {}", persistPath, e.getMessage());
+        }
+    }
+
+    // last persisted metadata
+    private volatile String lastPersistedPath = null;
+    private volatile java.time.Instant lastPersistedAt = null;
 
     @Autowired(required = false)
     private VectorRepository vectorRepository; // used for full rebuild
@@ -121,9 +165,19 @@ public class HnswAnnService implements AnnIndex, Serializable {
                         }
                         this.index = newIndex;
                     }
-                } catch (UnsupportedOperationException | NoSuchMethodError ignored) {
+                } catch (UnsupportedOperationException | NoSuchMethodError e) {
                     // some HNSW implementations may not support remove; fall back to rebuild pattern
-                    store.remove(id);
+                    Collection<com.github.jelmerk.hnswlib.core.Item<String, float[]>> items = index.items();
+                    HnswIndex<String, float[], Item<String, float[]>, Float> newIndex = HnswIndex.newBuilder(dimension, index.getDistanceFunction(), index.getMaxItemCount())
+                            .withM(index.getM())
+                            .withEfConstruction(index.getEfConstruction())
+                            .build();
+                    for (com.github.jelmerk.hnswlib.core.Item<String, float[]> it : items) {
+                        if (!Objects.equals(it.id(), id)) {
+                            newIndex.add(it);
+                        }
+                    }
+                    this.index = newIndex;
                 }
             } else {
                 store.remove(id);
@@ -247,9 +301,21 @@ public class HnswAnnService implements AnnIndex, Serializable {
         lock.readLock().lock();
         try {
             if (index != null) {
-                try (OutputStream os = new BufferedOutputStream(new FileOutputStream(file.toFile()))) {
-                    index.save(os);
+                // serialize a deterministic Map of id->vector extracted from the index
+                Map<String, float[]> persistMap = new HashMap<>();
+                for (com.github.jelmerk.hnswlib.core.Item<String, float[]> it : index.items()) {
+                    persistMap.put(it.id(), Arrays.copyOf(it.vector(), it.vector().length));
                 }
+                List<String> ids = new ArrayList<>();
+                for (String k : persistMap.keySet()) ids.add(k);
+                log.info("persistTo: extracted map size={} from index size={} ids={}", persistMap.size(), index.size(), ids);
+                try (ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(new FileOutputStream(file.toFile())))) {
+                    oos.writeObject(persistMap);
+                }
+                // record last persisted metadata on explicit persist
+                lastPersistedPath = file.toAbsolutePath().toString();
+                lastPersistedAt = java.time.Instant.now();
+                log.info("Persisted HNSW index (as map) to {}", lastPersistedPath);
                 return;
             }
             // fallback: serialize the buffer store
@@ -266,22 +332,45 @@ public class HnswAnnService implements AnnIndex, Serializable {
     public void loadFrom(java.nio.file.Path file) throws Exception {
         lock.writeLock().lock();
         try {
-            // first try to load as jelmerk index
-            try {
-                HnswIndex<String, float[], Item<String, float[]>, Float> loaded = HnswIndex.load(file);
-                this.index = loaded;
-                this.dimension = loaded.getDimensions();
-                return;
-            } catch (Exception ex) {
-                // fall through to try deserializing fallback store
-            }
-
+            // Prefer our serialized Map format first (deterministic), then fall back to jelmerk index load
+            boolean handled = false;
             try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(new FileInputStream(file.toFile())))) {
                 Object o = ois.readObject();
                 if (o instanceof Map) {
+                    // replace current index/store with the persisted map
+                    Map<String, float[]> persistedMap = (Map<String, float[]>) o;
+                    List<String> keys = new ArrayList<>(persistedMap.keySet());
+                    log.info("loadFrom: deserialized map size={} keys={}", persistedMap.size(), keys);
+                    // determine dimension
+                    int dim = -1;
+                    for (float[] v : persistedMap.values()) { if (v != null) { dim = v.length; break; } }
+                    if (dim == -1) return;
+                    // clear current state
+                    index = null;
                     store.clear();
-                    Map<String, float[]> m = (Map<String, float[]>) o;
-                    store.putAll(m);
+                    ensureIndex(dim);
+                    for (Map.Entry<String, float[]> e : persistedMap.entrySet()) {
+                        if (e.getValue() != null) index.add(new SimpleItem(e.getKey(), e.getValue()));
+                    }
+                    List<String> idxIds = new ArrayList<>();
+                    for (com.github.jelmerk.hnswlib.core.Item<String, float[]> it : index.items()) idxIds.add(it.id());
+                    log.info("loadFrom: index size after load={} ids={}", index.size(), idxIds);
+                    handled = true;
+                }
+            } catch (Exception ex) {
+                // not a Map or failed to deserialize; we'll try jelmerk load next
+            }
+
+            if (!handled) {
+                try {
+                    HnswIndex<String, float[], Item<String, float[]>, Float> loaded = HnswIndex.load(file);
+                    this.index = loaded;
+                    this.dimension = loaded.getDimensions();
+                    List<String> idxIds2 = new ArrayList<>();
+                    for (com.github.jelmerk.hnswlib.core.Item<String, float[]> it : index.items()) idxIds2.add(it.id());
+                    log.info("loadFrom: loaded jelmerk HnswIndex with size={} ids={}", index.size(), idxIds2);
+                } catch (Exception ex) {
+                    throw ex;
                 }
             }
         } finally {
@@ -325,6 +414,52 @@ public class HnswAnnService implements AnnIndex, Serializable {
     }
 
     public int getDimensions() { return this.dimension; }
+
+    @PreDestroy
+    public void autoPersistOnShutdown() {
+        if (!autoPersistEnabled) {
+            log.info("Auto-persist disabled (hnsw.auto.persist.enabled=false); skipping persist on shutdown");
+            return;
+        }
+        try {
+            long sz = size();
+            if (sz < autoPersistMinSize) {
+                log.info("Auto-persist skipped: index size {} < min-size {}", sz, autoPersistMinSize);
+                return;
+            }
+            if (persistPath == null || persistPath.isBlank()) {
+                log.warn("persistPath not configured; skipping auto-persist");
+                return;
+            }
+            java.nio.file.Path p = java.nio.file.Path.of(persistPath);
+            java.nio.file.Files.createDirectories(p.getParent());
+            persistTo(p);
+            lastPersistedPath = p.toAbsolutePath().toString();
+            lastPersistedAt = java.time.Instant.now();
+            log.info("HNSW persisted to {} (size={})", lastPersistedPath, size());
+        } catch (Exception e) {
+            log.error("Failed to auto-persist HNSW index: {}", e.getMessage(), e);
+        }
+    }
+
+    // expose last persist metadata for admin queries
+    public java.util.Map<String,Object> getLastPersistInfo() {
+        java.util.Map<String,Object> out = new java.util.HashMap<>();
+        out.put("path", lastPersistedPath);
+        out.put("timestamp", lastPersistedAt == null ? null : lastPersistedAt.toString());
+        out.put("autoPersistEnabled", autoPersistEnabled);
+        out.put("autoPersistMinSize", autoPersistMinSize);
+        return out;
+    }
+
+    // runtime accessors for auto-load flag (admin control)
+    public boolean isAutoLoadEnabled() {
+        return this.autoLoadEnabled;
+    }
+
+    public void setAutoLoadEnabled(boolean enabled) {
+        this.autoLoadEnabled = enabled;
+    }
 }
 
 // simple Item implementation for jelmerk HNSW

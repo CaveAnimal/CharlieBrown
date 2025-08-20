@@ -1,7 +1,6 @@
 package com.example.codetools;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
@@ -9,22 +8,45 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.stream.*;
 
+@Slf4j
 @Service
 public class FileScanner {
 
-    private static final Logger log = LoggerFactory.getLogger(FileScanner.class);
-
-    private final Map<String, String> index = new HashMap<>();
+    // keep a lightweight index of path -> lastModified to avoid OOM on very large repos
+    private final Map<String, Long> index = new HashMap<>();
     private final String rootPath;
     private final String applicationId;
+    private final Set<String> extensions;
 
     private final VectorService vectorService;
 
     public FileScanner(org.springframework.core.env.Environment env, VectorService vectorService) {
         String rp = env.getProperty("scanner.root.path");
         this.rootPath = rp == null ? "" : rp;
-    this.applicationId = env.getProperty("application.id", "default-app");
+        String appId = env.getProperty("application.id", "default-app");
+        if ((appId == null || appId.isBlank() || "default-app".equals(appId)) && this.rootPath != null && !this.rootPath.isBlank()) {
+            try {
+                java.nio.file.Path p = java.nio.file.Paths.get(this.rootPath);
+                java.nio.file.Path name = p.getFileName();
+                if (name != null) appId = name.toString();
+            } catch (Exception ignored) {}
+        }
+        this.applicationId = appId == null ? "default-app" : appId;
         this.vectorService = vectorService;
+        // supported extensions (configurable)
+        String ext = env.getProperty("scanner.extensions");
+        if (ext != null && !ext.isBlank()) {
+            this.extensions = Arrays.stream(ext.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .map(s -> s.startsWith(".") ? s.toLowerCase() : ("." + s.toLowerCase()))
+                    .collect(Collectors.toSet());
+        } else {
+            this.extensions = new HashSet<>(Arrays.asList(
+                    ".java", ".js", ".ts", ".jsx", ".tsx", ".py", ".go", ".rb", ".php",
+                    ".html", ".htm", ".css", ".scss", ".json", ".xml", ".md", ".properties"
+            ));
+        }
     }
 
     @PostConstruct
@@ -33,11 +55,10 @@ public class FileScanner {
             log.info("scanner.root.path not set; skipping file scan");
             return;
         }
-        Path root = Paths.get(rootPath);
-        try (Stream<Path> paths = Files.walk(root)) {
-            paths.filter(Files::isRegularFile)
-                    .filter(p -> p.toString().endsWith(".java") || p.toString().endsWith(".js"))
-                    .forEach(this::indexFile);
+        // reuse the new list/process API so async job and legacy scan use the same logic
+        List<String> files = listAllFiles();
+        for (String rel : files) {
+            processFile(rel);
         }
         log.info("Indexed {} files", index.size());
     }
@@ -47,7 +68,8 @@ public class FileScanner {
             String content = new String(Files.readAllBytes(file));
             Path root = Paths.get(rootPath);
             String rel = root.relativize(file).toString();
-            index.put(rel, content);
+            // store last-modified time only to avoid keeping large file contents in memory
+            try { index.put(rel, Files.getLastModifiedTime(file).toMillis()); } catch (Exception ignored) { index.put(rel, 0L); }
 
             // chunking parameters (characters)
             int chunkSize = 800; // default
@@ -82,16 +104,64 @@ public class FileScanner {
     }
 
     public List<QueryModels.CodeSnippet> fetchSnippets(List<String> paths, int max) {
-        return index.entrySet()
-                .stream()
-                .filter(e -> paths == null || paths.isEmpty() || paths.contains(e.getKey()))
+        return index.keySet().stream()
+                .filter(k -> paths == null || paths.isEmpty() || paths.contains(k))
                 .limit(max)
-                .map(e -> {
+                .map(k -> {
                     QueryModels.CodeSnippet s = new QueryModels.CodeSnippet();
-                    s.setPath(e.getKey());
-                    s.setContent(e.getValue());
+                    s.setPath(k);
+                    // read file content on demand
+                    try {
+                        java.nio.file.Path p = java.nio.file.Paths.get(rootPath).resolve(k);
+                        String content = java.nio.file.Files.readString(p);
+                        s.setContent(content);
+                    } catch (Exception ex) {
+                        s.setContent("");
+                    }
                     return s;
                 })
                 .collect(Collectors.toList());
+    }
+
+    // expose computed applicationId for admin operations
+    public String getApplicationId() {
+        return this.applicationId;
+    }
+
+    /**
+     * Return a list of relative file paths (relative to configured root) that match configured extensions.
+     * This is used by the async scanner job to iterate files and report progress.
+     */
+    public List<String> listAllFiles() throws IOException {
+        List<String> out = new ArrayList<>();
+        if (rootPath == null || rootPath.isBlank()) return out;
+        Path root = Paths.get(rootPath);
+        try (Stream<Path> paths = Files.walk(root)) {
+            paths.filter(Files::isRegularFile)
+                    .forEach(p -> {
+                        String s = p.toString().toLowerCase();
+                        boolean ok = false;
+                        for (String e : extensions) if (s.endsWith(e)) { ok = true; break; }
+                        if (!ok) return;
+                        try {
+                            String rel = root.relativize(p).toString();
+                            out.add(rel);
+                        } catch (Exception ignored) {}
+                    });
+        }
+        return out;
+    }
+
+    /**
+     * Process a single file (relative path) by reading content and upserting vector chunks.
+     * This reuses existing indexing/chunking logic.
+     */
+    public void processFile(String relativePath) {
+        try {
+            Path p = java.nio.file.Paths.get(rootPath).resolve(relativePath);
+            indexFile(p);
+        } catch (Exception e) {
+            log.warn("Failed to process {}: {}", relativePath, e.getMessage());
+        }
     }
 }

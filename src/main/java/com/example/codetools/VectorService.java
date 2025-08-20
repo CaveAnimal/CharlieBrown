@@ -1,10 +1,8 @@
 package com.example.codetools;
 
+import lombok.extern.slf4j.Slf4j;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.transaction.annotation.Transactional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -17,10 +15,11 @@ import org.springframework.stereotype.Service;
 
 import java.util.*;
 
+@Slf4j
 @Service
 public class VectorService {
 
-    private static final Logger log = LoggerFactory.getLogger(VectorService.class);
+    // lombok-provided 'log'
 
     @Autowired
     private VectorRepository repo;
@@ -53,6 +52,10 @@ public class VectorService {
                 return;
             }
             float[] vec = embeddingService.embed(content);
+            if (vec == null) {
+                log.warn("Embedding service returned null for applicationId={} path={}", applicationId, path);
+                return;
+            }
             byte[] blob = floatArrayToGzipBytes(vec);
             String vecJson = mapper.writeValueAsString(vec);
             VectorRecord r = existing == null ? new VectorRecord() : existing;

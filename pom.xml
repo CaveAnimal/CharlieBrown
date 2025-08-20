@@ -45,7 +45,7 @@
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
-            <version>1.18.32</version>
+            <version>1.18.38</version>
             <scope>provided</scope>
         </dependency>
         <!-- H2 for local/per-application persistent store (file-based) -->
@@ -103,7 +103,7 @@
                         <path>
                             <groupId>org.projectlombok</groupId>
                             <artifactId>lombok</artifactId>
-                            <version>1.18.32</version>
+                            <version>1.18.38</version>
                         </path>
                     </annotationProcessorPaths>
                     <!-- optional: fork to avoid IDE classloader issues -->

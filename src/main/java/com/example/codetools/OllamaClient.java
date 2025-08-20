@@ -1,14 +1,14 @@
 package com.example.codetools;
 
-import org.springframework.core.env.Environment;
-import org.springframework.stereotype.Service;
-
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.util.concurrent.TimeUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+
+import org.springframework.core.env.Environment;
+import org.springframework.stereotype.Service;
 
 @Service
 public class OllamaClient {
@@ -29,20 +29,19 @@ public class OllamaClient {
         this.processRunner = processRunner;
     }
 
-    public String queryModel(String question, List<QueryModels.CodeSnippet> snippets) throws Exception {
+    // Run Ollama with a raw prompt and return trimmed stdout
+    private String runWithPrompt(String promptStr) throws Exception {
         List<String> cmd = new ArrayList<>();
         cmd.add(command);
         cmd.add("run");
         cmd.add(model);
 
-    String promptStr = promptBuilder.build(question, snippets);
         log.info("OllamaClient: Running command: {} [prompt length={}]", String.join(" ", cmd), promptStr.length());
-        log.debug("OllamaClient: Everything that will be sent to Ollama (truncated 1000 chars):\n{}", promptStr.length() > 1000 ? promptStr.substring(0, 1000) + "..." : promptStr);
+        log.debug("OllamaClient: Prompt (truncated 1000 chars):\n{}", promptStr.length() > 1000 ? promptStr.substring(0, 1000) + "..." : promptStr);
 
         try {
             Process proc = processRunner.start(cmd);
 
-            // write prompt to stdin of the process to avoid CLI quoting/length issues
             try (java.io.OutputStream os = proc.getOutputStream()) {
                 os.write(promptStr.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                 os.flush();
@@ -79,7 +78,6 @@ public class OllamaClient {
             errReader.start();
 
             boolean finished = proc.waitFor(180, TimeUnit.SECONDS);
-            // Give readers a moment to drain
             outReader.join(2000);
             errReader.join(2000);
 
@@ -105,5 +103,47 @@ public class OllamaClient {
             log.error("OllamaClient: Exception while running Ollama command: {}", String.join(" ", cmd), e);
             throw e;
         }
+    }
+
+    public String queryModel(String question, List<QueryModels.CodeSnippet> snippets) throws Exception {
+        String promptStr = promptBuilder.build(question, snippets);
+        return runWithPrompt(promptStr);
+    }
+
+    /**
+     * Ask the model to classify whether a question requires consulting source code.
+     * Returns true if it should consult code (CODE), false if it's general knowledge (GENERAL).
+     */
+    public boolean classifyQuestion(String question) throws Exception {
+    String classifier = "You are a classifier. Decide whether the user question requires consulting the project's source code files to answer. "
+        + "Respond with exactly ONE token on a single line: either GENERAL or CODE and NOTHING ELSE. "
+        + "GENERAL means the question is general-knowledge, factual, or conceptual and does NOT require reading repository files. "
+        + "CODE means the question asks about file contents, exact implementation, debugging, code examples from this repo, or explicitly references files, paths, or repository structure.\n\n"
+        + "EXAMPLES (input => expected single-token output):\n"
+        + "What is the value of pi? => GENERAL\n"
+        + "How many planets are in the solar system? => GENERAL\n"
+        + "How to sort an array in Java? => GENERAL\n"
+        + "Show me the contents of src/main/java/com/example/MyClass.java => CODE\n"
+        + "Why does my NullPointerException occur at com/example/Foo.java:42? => CODE\n"
+        + "What does the function computeChecksum in file util/Checksum.java do? => CODE\n\n"
+        + "QUESTION:\n" + question + "\n\nREPLY WITH ONE TOKEN (GENERAL or CODE):\n";
+
+    String resp = runWithPrompt(classifier);
+    if (resp == null) return false;
+    // Take only the first non-empty token from the response
+        String[] toks = resp.trim().split("\\s+");
+    if (toks.length == 0) return false;
+    String first = toks[0].trim().toUpperCase();
+    log.info("OllamaClient: classification response='{}' (raw='{}')", first, resp.trim());
+        // Heuristic overrides for common general-knowledge questions that the model may misclassify.
+        String q = question == null ? "" : question.trim().toLowerCase();
+        // If user asks directly about pi or other simple factual tokens, treat as GENERAL
+        if (q.matches(".*\\b(pi|pi\\s+value|value of pi|what is pi|what's pi|define pi|approximate value of pi)\\b.*")) {
+            log.info("OllamaClient: heuristic override -> GENERAL for question='{}'", question);
+            return false;
+        }
+
+        if ("CODE".equals(first)) return true;
+        return false;
     }
 }
